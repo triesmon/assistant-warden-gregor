@@ -25,6 +25,6 @@ export function loadConfig(): AppConfig {
     discordToken,
     discordClientId,
     databasePath: process.env.DATABASE_PATH ?? path.join(".", "data", "steeds-bot.sqlite"),
-    pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 60_000)
+    pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 10_000)
   };
 }

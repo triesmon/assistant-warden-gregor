@@ -1,10 +1,12 @@
 export type AlertOffsetUnit = "minutes" | "hours" | "days";
+export type AlertEventTarget = "all" | "interested";
 
 export interface Alert {
   id: string;
   guildId: string;
   amount: number;
   unit: AlertOffsetUnit;
+  eventTarget: AlertEventTarget;
   recipientIds: string[];
   enabled: boolean;
   createdAt: string;
@@ -38,6 +40,7 @@ export interface ScheduledEventSnapshot {
   name: string;
   scheduledStartAt: Date | null;
   status: number;
+  interestedUserIds: string[];
 }
 
 export interface DueAlert {

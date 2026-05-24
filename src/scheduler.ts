@@ -1,4 +1,10 @@
-import { EmbedBuilder, GuildScheduledEventStatus, type Client, type MessageCreateOptions } from "discord.js";
+import {
+  EmbedBuilder,
+  GuildScheduledEventStatus,
+  type Client,
+  type GuildScheduledEvent,
+  type MessageCreateOptions
+} from "discord.js";
 import { formatOffset, offsetToMilliseconds } from "./offset";
 import type { AlertRepository } from "./repository";
 import type { Alert, DueAlert, FailedRecipient, ScheduledEventSnapshot } from "./types";
@@ -20,12 +26,16 @@ export function findDueAlerts(input: {
     }
 
     for (const alert of alerts) {
-      if (alert.recipientIds.length === 0 || !alert.enabled || !isAlertDue(event.scheduledStartAt, alert, input.now)) {
+      const targetRecipientIds =
+        alert.eventTarget === "all"
+          ? alert.recipientIds
+          : alert.recipientIds.filter((userId) => event.interestedUserIds.includes(userId));
+      if (targetRecipientIds.length === 0 || !alert.enabled || !isAlertDue(event.scheduledStartAt, alert, input.now)) {
         continue;
       }
 
       if (!input.wasSent(event.guildId, event.id, alert.id)) {
-        dueAlerts.push({ guildId: event.guildId, event, alert, recipientIds: alert.recipientIds });
+        dueAlerts.push({ guildId: event.guildId, event, alert, recipientIds: targetRecipientIds });
       }
     }
   }
@@ -71,12 +81,45 @@ async function fetchScheduledEvents(client: Client, repository: AlertRepository)
         guildId,
         name: event.name,
         scheduledStartAt: event.scheduledStartAt,
-        status: event.status
+        status: event.status,
+        interestedUserIds: await fetchInterestedUserIds(event)
       });
     }
   }
 
   return snapshots;
+}
+
+async function fetchInterestedUserIds(event: GuildScheduledEvent): Promise<string[]> {
+  const guild = event.guild;
+  if (!guild) {
+    return [];
+  }
+
+  const userIds = new Set<string>();
+  let after: string | undefined;
+
+  while (true) {
+    // discord.js supports pagination here at runtime, but the public type omits before/after.
+    const subscribers = await guild.scheduledEvents.fetchSubscribers(event.id, { limit: 100, after } as {
+      limit: number;
+      after?: string;
+    });
+    for (const userId of subscribers.keys()) {
+      userIds.add(userId);
+    }
+
+    if (subscribers.size < 100) {
+      break;
+    }
+
+    after = Array.from(subscribers.keys()).at(-1);
+    if (!after) {
+      break;
+    }
+  }
+
+  return Array.from(userIds);
 }
 
 async function sendDueAlert(client: Client, repository: AlertRepository, dueAlert: DueAlert): Promise<void> {

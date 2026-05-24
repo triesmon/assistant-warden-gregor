@@ -2,6 +2,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ComponentType,
   ContainerBuilder,
   MessageFlags,
   ModalBuilder,
@@ -9,6 +10,8 @@ import {
   SectionBuilder,
   SeparatorBuilder,
   SeparatorSpacingSize,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   TextDisplayBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -21,12 +24,13 @@ import {
   type ModalActionRowComponentBuilder,
   type ModalSubmitInteraction,
   type PermissionsBitField as PermissionsBitFieldType,
+  type StringSelectMenuInteraction,
   type UserSelectMenuInteraction
 } from "discord.js";
-import { EVENT_ALERTS_COMMAND } from "./commands";
+import { EVENT_ALERTS_COMMAND, SUBSCRIBE_COMMAND } from "./commands";
 import { formatOffset, OffsetParseError, parseAlertOffset } from "./offset";
 import type { AlertRepository } from "./repository";
-import type { Alert, SentAlert } from "./types";
+import type { Alert, AlertEventTarget, AlertOffsetUnit, SentAlert } from "./types";
 
 const IDS = {
   addAlert: "eventAlerts:addAlert",
@@ -36,14 +40,36 @@ const IDS = {
   back: "eventAlerts:back"
 } as const;
 
+const SUBSCRIPTION_IDS = {
+  add: "subscriptions:add",
+  modalAdd: "subscriptions:modal:add"
+} as const;
+
 const HISTORY_PAGE_SIZE = 5;
 const MAX_ALERTS = 25;
-const ALERTS_PER_CONTAINER = 4;
+const ALERTS_PER_CONTAINER = 10;
+const SUBSCRIPTIONS_PER_CONTAINER = 5;
+const ACTIVE_PANEL_TTL_MS = 14 * 60 * 1000;
+
+type PanelInteraction = ChatInputCommandInteraction | ModalSubmitInteraction;
+type PanelType = "admin" | "subscribe";
+
+interface ActivePanel {
+  interaction: PanelInteraction;
+  openedAt: number;
+}
+
+const activePanels = new Map<string, ActivePanel>();
 
 // Route Discord interactions into repository-backed alert configuration screens.
 export async function handleInteraction(interaction: Interaction, repository: AlertRepository): Promise<void> {
   if (interaction.isChatInputCommand() && interaction.commandName === EVENT_ALERTS_COMMAND) {
-    await handleCommand(interaction, repository);
+    await handleEventAlertsCommand(interaction, repository);
+    return;
+  }
+
+  if (interaction.isChatInputCommand() && interaction.commandName === SUBSCRIBE_COMMAND) {
+    await handleSubscribeCommand(interaction, repository);
     return;
   }
 
@@ -52,21 +78,60 @@ export async function handleInteraction(interaction: Interaction, repository: Al
     return;
   }
 
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith("subscriptions:eventTarget:")) {
+    await handleSubscriptionEventTargetSelect(interaction, repository);
+    return;
+  }
+
   if (interaction.isButton()) {
-    await handleButton(interaction, repository);
+    if (interaction.customId.startsWith("subscriptions:")) {
+      await handleSubscriptionButton(interaction, repository);
+      return;
+    }
+
+    await handleEventAlertsButton(interaction, repository);
     return;
   }
 
   if (interaction.isModalSubmit()) {
-    await handleModalSubmit(interaction, repository);
+    if (interaction.customId.startsWith("subscriptions:")) {
+      await handleSubscriptionModalSubmit(interaction, repository);
+      return;
+    }
+
+    await handleEventAlertsModalSubmit(interaction, repository);
   }
+}
+
+async function handleSubscriptionEventTargetSelect(
+  interaction: StringSelectMenuInteraction,
+  repository: AlertRepository
+): Promise<void> {
+  const guildId = await requireGuild(interaction);
+  if (!guildId) {
+    return;
+  }
+
+  const alertId = interaction.customId.split(":")[2];
+  const alert = repository.getAlert(alertId);
+  const eventTarget = parseEventTarget(interaction.values[0]);
+  let notice: string | undefined;
+  if (alert && alert.guildId === guildId && alert.recipientIds.includes(interaction.user.id) && eventTarget) {
+    const existingTargetSubscription = findSubscribedAlertByTiming(repository, guildId, interaction.user.id, alert.amount, alert.unit, eventTarget);
+    moveSubscriptionToEventTarget(repository, guildId, interaction.user.id, alert, eventTarget);
+    if (existingTargetSubscription && alert.eventTarget !== eventTarget) {
+      notice = `You already had ${formatOffset(alert.amount, alert.unit)} before - ${formatEventTarget(eventTarget)}. The duplicate row was removed.`;
+    }
+  }
+
+  await interaction.update(buildSubscriptionPanel(repository, guildId, interaction.user.id, notice));
 }
 
 export function canConfigureAlerts(permissions: Readonly<PermissionsBitFieldType> | null | undefined): boolean {
   return Boolean(permissions?.has(PermissionsBitField.Flags.ManageEvents));
 }
 
-async function handleCommand(
+async function handleEventAlertsCommand(
   interaction: ChatInputCommandInteraction,
   repository: AlertRepository
 ): Promise<void> {
@@ -76,7 +141,24 @@ async function handleCommand(
   }
 
   repository.ensureGuild(guildId);
+  await closePreviousPanel(guildId, interaction.user.id, "admin");
   await interaction.reply(asEphemeralV2(buildMainPanel(repository, guildId, interaction.user.id)));
+  rememberActivePanel(guildId, interaction.user.id, "admin", interaction);
+}
+
+async function handleSubscribeCommand(
+  interaction: ChatInputCommandInteraction,
+  repository: AlertRepository
+): Promise<void> {
+  const guildId = await requireGuild(interaction);
+  if (!guildId) {
+    return;
+  }
+
+  repository.ensureGuild(guildId);
+  await closePreviousPanel(guildId, interaction.user.id, "subscribe");
+  await interaction.reply(asEphemeralV2(buildSubscriptionPanel(repository, guildId, interaction.user.id)));
+  rememberActivePanel(guildId, interaction.user.id, "subscribe", interaction);
 }
 
 async function handleAlertRecipientSelect(
@@ -99,7 +181,7 @@ async function handleAlertRecipientSelect(
   await interaction.update(updatedAlert ? buildAlertPanel(updatedAlert) : buildMainPanel(repository, guildId, interaction.user.id));
 }
 
-async function handleButton(interaction: ButtonInteraction, repository: AlertRepository): Promise<void> {
+async function handleEventAlertsButton(interaction: ButtonInteraction, repository: AlertRepository): Promise<void> {
   const guildId = await requireConfigurableGuild(interaction);
   if (!guildId) {
     return;
@@ -111,7 +193,7 @@ async function handleButton(interaction: ButtonInteraction, repository: AlertRep
       return;
     }
 
-    await interaction.showModal(buildOffsetModal("eventAlerts:modal:add", "Add alert"));
+    await interaction.showModal(buildAdminAlertModal("eventAlerts:modal:add", "Add alert"));
     return;
   }
 
@@ -145,36 +227,7 @@ async function handleButton(interaction: ButtonInteraction, repository: AlertRep
       return;
     }
 
-    await interaction.update(buildAlertPanel(alert));
-    return;
-  }
-
-  if (interaction.customId.startsWith("eventAlerts:subscribe:")) {
-    const alertId = interaction.customId.split(":")[2];
-    const alert = repository.getAlert(alertId);
-    if (!alert || alert.guildId !== guildId) {
-      await interaction.update(buildMainPanel(repository, guildId, interaction.user.id));
-      return;
-    }
-
-    repository.setAlertRecipients(alert.id, [...alert.recipientIds, interaction.user.id]);
-    await interaction.update(buildMainPanel(repository, guildId, interaction.user.id));
-    return;
-  }
-
-  if (interaction.customId.startsWith("eventAlerts:unsubscribe:")) {
-    const alertId = interaction.customId.split(":")[2];
-    const alert = repository.getAlert(alertId);
-    if (!alert || alert.guildId !== guildId) {
-      await interaction.update(buildMainPanel(repository, guildId, interaction.user.id));
-      return;
-    }
-
-    repository.setAlertRecipients(
-      alert.id,
-      alert.recipientIds.filter((userId) => userId !== interaction.user.id)
-    );
-    await interaction.update(buildMainPanel(repository, guildId, interaction.user.id));
+    await interaction.showModal(buildAdminAlertModal(`eventAlerts:modal:edit:${alert.id}`, "Edit alert", alert));
     return;
   }
 
@@ -187,7 +240,7 @@ async function handleButton(interaction: ButtonInteraction, repository: AlertRep
     }
 
     await interaction.showModal(
-      buildOffsetModal(`eventAlerts:modal:edit:${alert.id}`, "Edit alert timing", formatOffset(alert.amount, alert.unit))
+      buildAdminAlertModal(`eventAlerts:modal:edit:${alert.id}`, "Edit alert", alert)
     );
     return;
   }
@@ -198,7 +251,31 @@ async function handleButton(interaction: ButtonInteraction, repository: AlertRep
   }
 }
 
-async function handleModalSubmit(
+async function handleSubscriptionButton(interaction: ButtonInteraction, repository: AlertRepository): Promise<void> {
+  const guildId = await requireGuild(interaction);
+  if (!guildId) {
+    return;
+  }
+
+  repository.ensureGuild(guildId);
+
+  if (interaction.customId === SUBSCRIPTION_IDS.add) {
+    await interaction.showModal(buildSubscriptionOffsetModal());
+    return;
+  }
+
+  if (interaction.customId.startsWith("subscriptions:unsubscribe:")) {
+    const alertId = interaction.customId.split(":")[2];
+    const alert = repository.getAlert(alertId);
+    if (alert && alert.guildId === guildId) {
+      repository.removeAlertRecipient(alert.id, interaction.user.id);
+    }
+
+    await interaction.update(buildSubscriptionPanel(repository, guildId, interaction.user.id));
+  }
+}
+
+async function handleEventAlertsModalSubmit(
   interaction: ModalSubmitInteraction,
   repository: AlertRepository
 ): Promise<void> {
@@ -217,17 +294,184 @@ async function handleModalSubmit(
   }
 
   if (interaction.customId === "eventAlerts:modal:add") {
-    const alert = repository.addAlert(guildId, parsed.amount, parsed.unit);
-    await interaction.reply(asEphemeralV2(buildAlertPanel(alert)));
+    const eventTarget = parseModalEventTarget(interaction);
+    const recipientIds = parseModalRecipientIds(interaction);
+    if (recipientIds.length === 0) {
+      await interaction.reply({ content: "Choose at least one non-bot recipient for this alert.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    const savedAlert = saveAdminAlert(repository, guildId, parsed.amount, parsed.unit, eventTarget, recipientIds);
+    if (!savedAlert) {
+      await interaction.reply({
+        content: `An alert for ${formatOffset(parsed.amount, parsed.unit)} before - ${formatEventTarget(eventTarget)} already exists. Edit that row instead.`,
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    await respondToAdminModal(interaction, repository, guildId);
     return;
   }
 
   if (interaction.customId.startsWith("eventAlerts:modal:edit:")) {
-    const alert = repository.updateAlert(interaction.customId.split(":")[3], parsed.amount, parsed.unit);
-    await interaction.reply(
-      asEphemeralV2(alert && alert.guildId === guildId ? buildAlertPanel(alert) : buildMainPanel(repository, guildId, interaction.user.id))
-    );
+    const eventTarget = parseModalEventTarget(interaction);
+    const alertId = interaction.customId.split(":")[3];
+    const existingAlert = repository.getAlert(alertId);
+    const recipientIds = parseModalRecipientIds(interaction, existingAlert?.recipientIds ?? []);
+    const savedAlert = saveAdminAlert(repository, guildId, parsed.amount, parsed.unit, eventTarget, recipientIds, alertId);
+    if (!savedAlert) {
+      await interaction.reply({
+        content: `An alert for ${formatOffset(parsed.amount, parsed.unit)} before - ${formatEventTarget(eventTarget)} already exists. Edit that row instead.`,
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    await respondToAdminModal(interaction, repository, guildId);
   }
+}
+
+async function handleSubscriptionModalSubmit(
+  interaction: ModalSubmitInteraction,
+  repository: AlertRepository
+): Promise<void> {
+  const guildId = await requireGuild(interaction);
+  if (!guildId) {
+    return;
+  }
+
+  let parsed: ReturnType<typeof parseAlertOffset>;
+  try {
+    parsed = parseAlertOffset(interaction.fields.getTextInputValue("offset"));
+  } catch (error) {
+    const message = error instanceof OffsetParseError ? error.message : "Invalid offset.";
+    await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (interaction.customId === SUBSCRIPTION_IDS.modalAdd) {
+    const eventTarget = parseModalEventTarget(interaction);
+    const existingTimingSubscription = findSubscribedAlertByTiming(repository, guildId, interaction.user.id, parsed.amount, parsed.unit);
+    if (existingTimingSubscription) {
+      const notice = `You already have ${formatOffset(parsed.amount, parsed.unit)} before - ${formatEventTarget(existingTimingSubscription.eventTarget)}. Duplicate timing subscriptions are not created.`;
+      await closePreviousPanel(guildId, interaction.user.id, "subscribe");
+      await interaction.reply(asEphemeralV2(buildSubscriptionPanel(repository, guildId, interaction.user.id, notice)));
+      rememberActivePanel(guildId, interaction.user.id, "subscribe", interaction);
+      return;
+    }
+
+    const alert = subscribeUserToOffset(repository, guildId, interaction.user.id, parsed.amount, parsed.unit, eventTarget);
+    if (!alert) {
+      await interaction.reply({ content: `This server already has the maximum of ${MAX_ALERTS} alerts.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    await closePreviousPanel(guildId, interaction.user.id, "subscribe");
+    await interaction.reply(asEphemeralV2(buildSubscriptionPanel(repository, guildId, interaction.user.id)));
+    rememberActivePanel(guildId, interaction.user.id, "subscribe", interaction);
+  }
+}
+
+export function subscribeUserToOffset(
+  repository: AlertRepository,
+  guildId: string,
+  userId: string,
+  amount: number,
+  unit: AlertOffsetUnit,
+  eventTarget: AlertEventTarget = "interested"
+): Alert | null {
+  const existingTimingSubscription = repository
+    .listSubscribedAlerts(guildId, userId)
+    .find((alert) => alert.amount === amount && alert.unit === unit);
+  if (existingTimingSubscription) {
+    return existingTimingSubscription;
+  }
+
+  const matchingAlerts = repository.findAlertsByOffset(guildId, amount, unit, eventTarget);
+  const existingTargetSubscription = matchingAlerts.find((alert) => alert.recipientIds.includes(userId));
+  if (existingTargetSubscription) {
+    return existingTargetSubscription;
+  }
+
+  const reusableAlert = matchingAlerts[0];
+  if (reusableAlert) {
+    repository.addAlertRecipient(reusableAlert.id, userId);
+    return repository.getAlert(reusableAlert.id);
+  }
+
+  if (repository.listAlerts(guildId).length >= MAX_ALERTS) {
+    return null;
+  }
+
+  const alert = repository.addAlert(guildId, amount, unit, eventTarget);
+  repository.addAlertRecipient(alert.id, userId);
+  return repository.getAlert(alert.id);
+}
+
+function findSubscribedAlertByTiming(
+  repository: AlertRepository,
+  guildId: string,
+  userId: string,
+  amount: number,
+  unit: AlertOffsetUnit,
+  eventTarget?: AlertEventTarget
+): Alert | undefined {
+  return repository
+    .listSubscribedAlerts(guildId, userId)
+    .find((alert) => alert.amount === amount && alert.unit === unit && (!eventTarget || alert.eventTarget === eventTarget));
+}
+
+export function saveAdminAlert(
+  repository: AlertRepository,
+  guildId: string,
+  amount: number,
+  unit: AlertOffsetUnit,
+  eventTarget: AlertEventTarget,
+  recipientIds: string[],
+  sourceAlertId?: string
+): Alert | null {
+  const uniqueRecipientIds = Array.from(new Set(recipientIds));
+  const sourceAlert = sourceAlertId ? repository.getAlert(sourceAlertId) : null;
+  const validSourceAlertId = sourceAlert?.guildId === guildId ? sourceAlert.id : undefined;
+  const matchingAlerts = repository.findAlertsByOffset(guildId, amount, unit, eventTarget);
+  if (matchingAlerts.some((alert) => alert.id !== validSourceAlertId)) {
+    return null;
+  }
+
+  if (sourceAlertId) {
+    const updatedAlert = validSourceAlertId ? repository.updateAlert(validSourceAlertId, amount, unit, eventTarget) : null;
+    return updatedAlert && updatedAlert.guildId === guildId ? repository.setAlertRecipients(updatedAlert.id, uniqueRecipientIds) : null;
+  }
+
+  const alert = repository.addAlert(guildId, amount, unit, eventTarget);
+  return repository.setAlertRecipients(alert.id, uniqueRecipientIds);
+}
+
+export function moveSubscriptionToEventTarget(
+  repository: AlertRepository,
+  guildId: string,
+  userId: string,
+  alert: Alert,
+  eventTarget: AlertEventTarget
+): Alert | null {
+  if (alert.eventTarget === eventTarget) {
+    return alert;
+  }
+
+  const targetAlerts = repository.findAlertsByOffset(guildId, alert.amount, alert.unit, eventTarget);
+  const existingTargetSubscription = targetAlerts.find((targetAlert) => targetAlert.recipientIds.includes(userId));
+  if (existingTargetSubscription) {
+    repository.removeAlertRecipient(alert.id, userId);
+    return existingTargetSubscription;
+  }
+
+  if (targetAlerts.length === 0 && alert.recipientIds.length > 1 && repository.listAlerts(guildId).length >= MAX_ALERTS) {
+    return null;
+  }
+
+  repository.removeAlertRecipient(alert.id, userId);
+  return subscribeUserToOffset(repository, guildId, userId, alert.amount, alert.unit, eventTarget);
 }
 
 async function requireConfigurableGuild(
@@ -251,6 +495,61 @@ async function requireConfigurableGuild(
   }
 
   return interaction.guildId;
+}
+
+async function requireGuild(
+  interaction: ChatInputCommandInteraction | ButtonInteraction | ModalSubmitInteraction | StringSelectMenuInteraction
+): Promise<string | null> {
+  if (!interaction.guildId) {
+    await interaction.reply({ content: "Use this command in a server.", flags: MessageFlags.Ephemeral });
+    return null;
+  }
+
+  return interaction.guildId;
+}
+
+async function closePreviousPanel(guildId: string, userId: string, panelType: PanelType): Promise<void> {
+  const key = activePanelKey(guildId, userId, panelType);
+  const previous = activePanels.get(key);
+  if (!previous) {
+    return;
+  }
+
+  activePanels.delete(key);
+  if (Date.now() - previous.openedAt > ACTIVE_PANEL_TTL_MS) {
+    return;
+  }
+
+  // Discord interaction tokens expire quickly, so stale cleanup failures are expected.
+  try {
+    await previous.interaction.deleteReply();
+  } catch {
+    // Best-effort cleanup only; the new panel should still open.
+  }
+}
+
+async function respondToAdminModal(
+  interaction: ModalSubmitInteraction,
+  repository: AlertRepository,
+  guildId: string
+): Promise<void> {
+  const panel = buildMainPanel(repository, guildId, interaction.user.id);
+  if (interaction.isFromMessage()) {
+    await interaction.update(panel);
+    return;
+  }
+
+  await closePreviousPanel(guildId, interaction.user.id, "admin");
+  await interaction.reply(asEphemeralV2(panel));
+  rememberActivePanel(guildId, interaction.user.id, "admin", interaction);
+}
+
+function rememberActivePanel(guildId: string, userId: string, panelType: PanelType, interaction: PanelInteraction): void {
+  activePanels.set(activePanelKey(guildId, userId, panelType), { interaction, openedAt: Date.now() });
+}
+
+function activePanelKey(guildId: string, userId: string, panelType: PanelType): string {
+  return `${guildId}:${userId}:${panelType}`;
 }
 
 function asEphemeralV2(panel: Pick<InteractionReplyOptions, "components">): InteractionReplyOptions {
@@ -282,7 +581,7 @@ export function buildMainPanel(
   if (alerts.length === 0) {
     headerContainer.addTextDisplayComponents(new TextDisplayBuilder().setContent("No alerts configured."));
   } else {
-    // Keep each container under Discord's v2 component limit while rendering per-alert controls.
+    // Keep each container under Discord's v2 component limit while rendering alert rows.
     for (const alertGroup of chunkArray(alerts.slice(0, MAX_ALERTS), ALERTS_PER_CONTAINER)) {
       const alertContainer = new ContainerBuilder();
       for (const alert of alertGroup) {
@@ -294,9 +593,8 @@ export function buildMainPanel(
                 .setCustomId(`eventAlerts:openAlert:${alert.id}`)
                 .setLabel("Edit")
                 .setStyle(ButtonStyle.Secondary)
-          )
+            )
         );
-        alertContainer.addActionRowComponents(buildSubscriptionRow(alert, currentUserId));
       }
       components.push(alertContainer);
     }
@@ -317,28 +615,62 @@ export function buildMainPanel(
   return { components, flags: MessageFlags.IsComponentsV2 };
 }
 
+export function buildSubscriptionPanel(
+  repository: AlertRepository,
+  guildId: string,
+  userId: string,
+  notice?: string
+): InteractionReplyOptions & InteractionUpdateOptions {
+  const alerts = repository.listSubscribedAlerts(guildId, userId);
+  const headerContainer = new ContainerBuilder().addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(["# Event subscriptions", "Manage your scheduled event alert DMs."].join("\n"))
+  );
+  const components: Array<ContainerBuilder | ActionRowBuilder<ButtonBuilder>> = [headerContainer];
+
+  if (notice) {
+    headerContainer.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));
+    headerContainer.addTextDisplayComponents(new TextDisplayBuilder().setContent(`**Notice**\n${notice}`));
+  }
+
+  if (alerts.length === 0) {
+    headerContainer.addTextDisplayComponents(new TextDisplayBuilder().setContent("You are not subscribed to any event alerts yet."));
+  } else {
+    // Split subscribed alert rows so each v2 container stays under Discord's component cap.
+    for (const alertGroup of chunkArray(alerts.slice(0, MAX_ALERTS), SUBSCRIPTIONS_PER_CONTAINER)) {
+      const alertContainer = new ContainerBuilder();
+      for (const alert of alertGroup) {
+        alertContainer.addSectionComponents(
+          new SectionBuilder()
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(formatSubscriptionSummary(alert)))
+            .setButtonAccessory(
+              new ButtonBuilder()
+                .setCustomId(`subscriptions:unsubscribe:${alert.id}`)
+                .setLabel("Unsubscribe")
+                .setStyle(ButtonStyle.Danger)
+            )
+        );
+        alertContainer.addActionRowComponents(buildEventTargetRow(alert));
+      }
+      components.push(alertContainer);
+    }
+  }
+
+  headerContainer.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));
+
+  const buttonRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(SUBSCRIPTION_IDS.add).setLabel("Create alert").setStyle(ButtonStyle.Primary)
+  );
+
+  components.push(buttonRow);
+  return { components, flags: MessageFlags.IsComponentsV2 };
+}
+
 function chunkArray<T>(items: T[], size: number): T[][] {
   const chunks: T[][] = [];
   for (let index = 0; index < items.length; index += size) {
     chunks.push(items.slice(index, index + size));
   }
   return chunks;
-}
-
-function buildSubscriptionRow(alert: Alert, currentUserId?: string): ActionRowBuilder<ButtonBuilder> {
-  const isSubscribed = Boolean(currentUserId && alert.recipientIds.includes(currentUserId));
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`eventAlerts:subscribe:${alert.id}`)
-      .setLabel("Subscribe")
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(isSubscribed || !currentUserId),
-    new ButtonBuilder()
-      .setCustomId(`eventAlerts:unsubscribe:${alert.id}`)
-      .setLabel("Unsubscribe")
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled(!isSubscribed)
-  );
 }
 
 export function buildAlertPanel(alert: Alert): InteractionUpdateOptions {
@@ -349,6 +681,7 @@ export function buildAlertPanel(alert: Alert): InteractionUpdateOptions {
       [
         "# Alert",
         `${formatOffset(alert.amount, alert.unit)} before event start.`,
+        `Event filters: ${formatEventTarget(alert.eventTarget)}`,
         "",
         `**Recipients**`,
         recipients
@@ -369,7 +702,7 @@ export function buildAlertPanel(alert: Alert): InteractionUpdateOptions {
   const recipientRow = new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(recipientSelect);
 
   const buttonRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`eventAlerts:editAlert:${alert.id}`).setLabel("Edit timing").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`eventAlerts:editAlert:${alert.id}`).setLabel("Edit alert").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`eventAlerts:deleteAlert:${alert.id}`).setLabel("Delete").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId(IDS.back).setLabel("Back").setStyle(ButtonStyle.Secondary)
   );
@@ -426,7 +759,31 @@ export function buildClearHistoryConfirmationPanel(repository: AlertRepository, 
   return { components: [container, row], flags: MessageFlags.IsComponentsV2 };
 }
 
-function buildOffsetModal(customId: string, title: string, value?: string): ModalBuilder {
+export function buildAdminAlertModal(customId: string, title: string, alert?: Alert): ModalBuilder {
+  return buildAlertModal({
+    customId,
+    title,
+    value: alert ? formatOffset(alert.amount, alert.unit) : undefined,
+    eventTarget: alert?.eventTarget ?? "interested",
+    recipientIds: alert?.recipientIds ?? [],
+    includeRecipients: true,
+    requireRecipients: !alert
+  });
+}
+
+function buildOffsetModal(customId: string, title: string, value?: string, eventTarget: AlertEventTarget = "interested"): ModalBuilder {
+  return buildAlertModal({ customId, title, value, eventTarget, recipientIds: [], includeRecipients: false, requireRecipients: false });
+}
+
+function buildAlertModal(input: {
+  customId: string;
+  title: string;
+  value?: string;
+  eventTarget: AlertEventTarget;
+  recipientIds: string[];
+  includeRecipients: boolean;
+  requireRecipients: boolean;
+}): ModalBuilder {
   const offsetInput = new TextInputBuilder()
     .setCustomId("offset")
     .setLabel("When should the alert send?")
@@ -434,21 +791,113 @@ function buildOffsetModal(customId: string, title: string, value?: string): Moda
     .setRequired(true)
     .setStyle(TextInputStyle.Short);
 
-  if (value) {
-    offsetInput.setValue(value);
+  if (input.value) {
+    offsetInput.setValue(input.value);
   }
 
-  // Discord modals only support text inputs, so timing is collected here.
-  return new ModalBuilder()
-    .setCustomId(customId)
-    .setTitle(title)
-    .addComponents(new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(offsetInput));
+  const eventTargetSelect = buildEventTargetSelect("eventTarget", input.eventTarget);
+  const modal = new ModalBuilder()
+    .setCustomId(input.customId)
+    .setTitle(input.title)
+    .addComponents(
+      new ActionRowBuilder<ModalActionRowComponentBuilder>().addComponents(offsetInput),
+      {
+        type: ComponentType.Label,
+        label: "Event filters",
+        component: eventTargetSelect.toJSON()
+      }
+    );
+
+  if (input.includeRecipients) {
+    const recipientSelect = new UserSelectMenuBuilder()
+      .setCustomId("recipients")
+      .setPlaceholder("Select recipients for this alert")
+      .setMinValues(input.requireRecipients ? 1 : 0)
+      .setMaxValues(25);
+
+    if (input.recipientIds.length > 0) {
+      recipientSelect.setDefaultUsers(input.recipientIds.slice(0, 25));
+    }
+
+    const recipientComponent = recipientSelect.toJSON() as ReturnType<UserSelectMenuBuilder["toJSON"]> & { required?: boolean };
+    recipientComponent.required = input.requireRecipients;
+
+    modal.addComponents({
+      type: ComponentType.Label,
+      label: "Recipients",
+      component: recipientComponent
+    });
+  }
+
+  // Components v2 modals use labels to host non-text inputs such as select menus.
+  return modal;
+}
+
+function buildSubscriptionOffsetModal(): ModalBuilder {
+  return buildOffsetModal(SUBSCRIPTION_IDS.modalAdd, "Create alert", undefined, "interested");
 }
 
 function formatAlertSummary(alert: Alert, currentUserId?: string): string {
   const recipientIds = prioritizeCurrentUser(alert.recipientIds, currentUserId);
   const recipientText = recipientIds.length > 0 ? recipientIds.map((userId) => `<@${userId}>`).join(", ") : "No recipients";
-  return `**${formatOffset(alert.amount, alert.unit)} before**\n${recipientText}`;
+  return `**${formatOffset(alert.amount, alert.unit)} before - ${formatEventTarget(alert.eventTarget)}**\n${recipientText}`;
+}
+
+function formatSubscriptionSummary(alert: Alert): string {
+  return `**${formatOffset(alert.amount, alert.unit)} before - ${formatEventTarget(alert.eventTarget)}**`;
+}
+
+function buildEventTargetRow(alert: Alert): ActionRowBuilder<StringSelectMenuBuilder> {
+  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+    buildEventTargetSelect(`subscriptions:eventTarget:${alert.id}`, alert.eventTarget)
+  );
+}
+
+function buildEventTargetSelect(customId: string, eventTarget: AlertEventTarget): StringSelectMenuBuilder {
+  return new StringSelectMenuBuilder()
+    .setCustomId(customId)
+    .setPlaceholder("Event filters")
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(
+      new StringSelectMenuOptionBuilder()
+        .setLabel("All")
+        .setDescription("Alert me for all scheduled events.")
+        .setValue("all")
+        .setDefault(eventTarget === "all"),
+      new StringSelectMenuOptionBuilder()
+        .setLabel("Interested")
+        .setDescription("Only alert me for events I marked Interested.")
+        .setValue("interested")
+        .setDefault(eventTarget === "interested")
+    );
+}
+
+function parseEventTarget(value: string | undefined): AlertEventTarget | null {
+  return value === "all" || value === "interested" ? value : null;
+}
+
+function parseModalEventTarget(interaction: ModalSubmitInteraction): AlertEventTarget {
+  try {
+    return parseEventTarget(interaction.fields.getStringSelectValues("eventTarget")[0]) ?? "interested";
+  } catch {
+    return "interested";
+  }
+}
+
+function parseModalRecipientIds(interaction: ModalSubmitInteraction, fallback: string[] = []): string[] {
+  try {
+    const selectedUsers = interaction.fields.getSelectedUsers("recipients");
+    return Array.from(selectedUsers?.values() ?? [])
+      .filter((user) => !user.bot)
+      .map((user) => user.id);
+  } catch {
+    return fallback;
+  }
+}
+
+function formatEventTarget(eventTarget: AlertEventTarget): string {
+  return eventTarget === "all" ? "All" : "Interested";
 }
 
 function prioritizeCurrentUser(recipientIds: string[], currentUserId?: string): string[] {

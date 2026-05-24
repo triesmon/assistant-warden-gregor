@@ -1,12 +1,13 @@
 import crypto from "node:crypto";
 import type Database from "better-sqlite3";
-import type { Alert, AlertOffsetUnit, FailedRecipient, SentAlert } from "./types";
+import type { Alert, AlertEventTarget, AlertOffsetUnit, FailedRecipient, SentAlert } from "./types";
 
 interface AlertRow {
   id: string;
   guild_id: string;
   amount: number;
   unit: AlertOffsetUnit;
+  event_target: AlertEventTarget;
   enabled: 0 | 1;
   created_at: string;
   updated_at: string;
@@ -50,9 +51,32 @@ export class AlertRepository {
   }
 
   listAlerts(guildId: string): Alert[] {
+    this.normalizeAlerts(guildId);
     const rows = this.db
-      .prepare("SELECT * FROM alerts WHERE guild_id = ? ORDER BY amount, unit, created_at")
+      .prepare("SELECT * FROM alerts WHERE guild_id = ? ORDER BY amount, unit, event_target, created_at")
       .all(guildId) as AlertRow[];
+    return rows.map((row) => this.mapAlertRow(row));
+  }
+
+  listSubscribedAlerts(guildId: string, userId: string): Alert[] {
+    this.normalizeAlerts(guildId);
+    const rows = this.db
+      .prepare(
+        `SELECT alerts.*
+         FROM alerts
+         INNER JOIN alert_recipients ON alert_recipients.alert_id = alerts.id
+         WHERE alerts.guild_id = ? AND alert_recipients.user_id = ?
+         ORDER BY alerts.amount, alerts.unit, alerts.event_target, alerts.created_at`
+      )
+      .all(guildId, userId) as AlertRow[];
+    return rows.map((row) => this.mapAlertRow(row));
+  }
+
+  findAlertsByOffset(guildId: string, amount: number, unit: AlertOffsetUnit, eventTarget: AlertEventTarget): Alert[] {
+    this.normalizeAlerts(guildId);
+    const rows = this.db
+      .prepare("SELECT * FROM alerts WHERE guild_id = ? AND amount = ? AND unit = ? AND event_target = ? ORDER BY created_at")
+      .all(guildId, amount, unit, eventTarget) as AlertRow[];
     return rows.map((row) => this.mapAlertRow(row));
   }
 
@@ -61,16 +85,16 @@ export class AlertRepository {
     return row ? this.mapAlertRow(row) : null;
   }
 
-  addAlert(guildId: string, amount: number, unit: AlertOffsetUnit): Alert {
+  addAlert(guildId: string, amount: number, unit: AlertOffsetUnit, eventTarget: AlertEventTarget = "interested"): Alert {
     this.ensureGuild(guildId);
     const now = new Date().toISOString();
     const id = crypto.randomUUID();
     this.db
       .prepare(
-        `INSERT INTO alerts (id, guild_id, amount, unit, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 1, ?, ?)`
+        `INSERT INTO alerts (id, guild_id, amount, unit, event_target, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
       )
-      .run(id, guildId, amount, unit, now, now);
+      .run(id, guildId, amount, unit, eventTarget, now, now);
 
     const alert = this.getAlert(id);
     if (!alert) {
@@ -79,9 +103,11 @@ export class AlertRepository {
     return alert;
   }
 
-  updateAlert(alertId: string, amount: number, unit: AlertOffsetUnit): Alert | null {
+  updateAlert(alertId: string, amount: number, unit: AlertOffsetUnit, eventTarget: AlertEventTarget): Alert | null {
     const now = new Date().toISOString();
-    this.db.prepare("UPDATE alerts SET amount = ?, unit = ?, updated_at = ? WHERE id = ?").run(amount, unit, now, alertId);
+    this.db
+      .prepare("UPDATE alerts SET amount = ?, unit = ?, event_target = ?, updated_at = ? WHERE id = ?")
+      .run(amount, unit, eventTarget, now, alertId);
     return this.getAlert(alertId);
   }
 
@@ -112,6 +138,29 @@ export class AlertRepository {
     });
 
     updateRecipients();
+    if (uniqueUserIds.length === 0) {
+      this.deleteAlert(alertId);
+      return null;
+    }
+
+    return this.getAlert(alertId);
+  }
+
+  addAlertRecipient(alertId: string, userId: string): Alert | null {
+    const now = new Date().toISOString();
+    this.db
+      .prepare("INSERT OR IGNORE INTO alert_recipients (alert_id, user_id, created_at) VALUES (?, ?, ?)")
+      .run(alertId, userId, now);
+    return this.getAlert(alertId);
+  }
+
+  removeAlertRecipient(alertId: string, userId: string): Alert | null {
+    this.db.prepare("DELETE FROM alert_recipients WHERE alert_id = ? AND user_id = ?").run(alertId, userId);
+    if (this.getAlertRecipients(alertId).length === 0) {
+      this.deleteAlert(alertId);
+      return null;
+    }
+
     return this.getAlert(alertId);
   }
 
@@ -177,11 +226,86 @@ export class AlertRepository {
       guildId: row.guild_id,
       amount: row.amount,
       unit: row.unit,
+      eventTarget: row.event_target,
       recipientIds: this.getAlertRecipients(row.id),
       enabled: row.enabled === 1,
       createdAt: row.created_at,
       updatedAt: row.updated_at
     };
+  }
+
+  private normalizeAlerts(guildId: string): void {
+    this.deleteRecipientlessAlerts(guildId);
+    this.mergeDuplicateAlerts(guildId);
+  }
+
+  private mergeDuplicateAlerts(guildId: string): void {
+    const rows = this.db
+      .prepare("SELECT * FROM alerts WHERE guild_id = ? ORDER BY amount, unit, event_target, created_at")
+      .all(guildId) as AlertRow[];
+    const rowsByKey = new Map<string, AlertRow[]>();
+    for (const row of rows) {
+      const key = `${row.amount}:${row.unit}:${row.event_target}`;
+      rowsByKey.set(key, [...(rowsByKey.get(key) ?? []), row]);
+    }
+
+    // Fold legacy duplicate rules into the oldest matching alert so each timing/filter pair has one row.
+    const mergeDuplicates = this.db.transaction((groups: AlertRow[][]) => {
+      for (const group of groups) {
+        const [canonical, ...duplicates] = group;
+        if (!canonical || duplicates.length === 0) {
+          continue;
+        }
+
+        const recipientIds = Array.from(
+          new Set([canonical.id, ...duplicates.map((row) => row.id)].flatMap((alertId) => this.getAlertRecipients(alertId)))
+        );
+        const now = new Date().toISOString();
+        const insertRecipient = this.db.prepare(
+          "INSERT OR IGNORE INTO alert_recipients (alert_id, user_id, created_at) VALUES (?, ?, ?)"
+        );
+        for (const userId of recipientIds) {
+          insertRecipient.run(canonical.id, userId, now);
+        }
+
+        for (const duplicate of duplicates) {
+          this.moveSentHistoryToCanonicalAlert(guildId, duplicate.id, canonical.id);
+          this.deleteAlert(duplicate.id);
+        }
+      }
+    });
+
+    mergeDuplicates(Array.from(rowsByKey.values()));
+  }
+
+  private moveSentHistoryToCanonicalAlert(guildId: string, duplicateAlertId: string, canonicalAlertId: string): void {
+    this.db
+      .prepare(
+        `UPDATE sent_alerts
+         SET alert_id = ?
+         WHERE guild_id = ?
+         AND alert_id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM sent_alerts existing
+           WHERE existing.guild_id = sent_alerts.guild_id
+           AND existing.event_id = sent_alerts.event_id
+           AND existing.alert_id = ?
+         )`
+      )
+      .run(canonicalAlertId, guildId, duplicateAlertId, canonicalAlertId);
+    this.db.prepare("DELETE FROM sent_alerts WHERE guild_id = ? AND alert_id = ?").run(guildId, duplicateAlertId);
+  }
+
+  private deleteRecipientlessAlerts(guildId: string): void {
+    this.db
+      .prepare(
+        `DELETE FROM alerts
+         WHERE guild_id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM alert_recipients WHERE alert_recipients.alert_id = alerts.id
+         )`
+      )
+      .run(guildId);
   }
 }
 

@@ -17,8 +17,135 @@ describe("AlertRepository", () => {
 
     expect(repository.getAlertRecipients(alert.id)).toEqual(["user-1", "user-2"]);
     expect(repository.listAlerts("guild-1")).toMatchObject([
-      { id: alert.id, amount: 2, unit: "hours", recipientIds: ["user-1", "user-2"] }
+      {
+        id: alert.id,
+        amount: 2,
+        unit: "hours",
+        eventTarget: "interested",
+        recipientIds: ["user-1", "user-2"]
+      }
     ]);
+  });
+
+  it("persists alert-level event targets", () => {
+    const repository = createRepository();
+    const alert = repository.addAlert("guild-1", 30, "minutes", "all");
+    repository.setAlertRecipients(alert.id, ["user-1", "user-2"]);
+
+    expect(repository.getAlert(alert.id)).toMatchObject({ eventTarget: "all" });
+  });
+
+  it("updates alert timing and event target together", () => {
+    const repository = createRepository();
+    const alert = repository.addAlert("guild-1", 30, "minutes");
+    repository.setAlertRecipients(alert.id, ["user-1", "user-2"]);
+
+    const updatedAlert = repository.updateAlert(alert.id, 2, "hours", "all");
+
+    expect(updatedAlert).toMatchObject({ amount: 2, unit: "hours", eventTarget: "all", recipientIds: ["user-1", "user-2"] });
+  });
+
+  it("lists only alerts a user is subscribed to", () => {
+    const repository = createRepository();
+    const subscribedAlert = repository.addAlert("guild-1", 30, "minutes");
+    const otherAlert = repository.addAlert("guild-1", 2, "hours");
+    const otherGuildAlert = repository.addAlert("guild-2", 1, "days");
+    repository.setAlertRecipients(subscribedAlert.id, ["user-1"]);
+    repository.setAlertRecipients(otherAlert.id, ["user-2"]);
+    repository.setAlertRecipients(otherGuildAlert.id, ["user-1"]);
+
+    expect(repository.listSubscribedAlerts("guild-1", "user-1").map((alert) => alert.id)).toEqual([subscribedAlert.id]);
+  });
+
+  it("finds alerts by exact offset", () => {
+    const repository = createRepository();
+    const matchingAlert = repository.addAlert("guild-1", 30, "minutes", "all");
+    const wrongUnitAlert = repository.addAlert("guild-1", 30, "hours");
+    const wrongGuildAlert = repository.addAlert("guild-2", 30, "minutes");
+    const wrongTargetAlert = repository.addAlert("guild-1", 30, "minutes", "interested");
+    repository.setAlertRecipients(matchingAlert.id, ["user-1"]);
+    repository.setAlertRecipients(wrongUnitAlert.id, ["user-1"]);
+    repository.setAlertRecipients(wrongGuildAlert.id, ["user-1"]);
+    repository.setAlertRecipients(wrongTargetAlert.id, ["user-1"]);
+
+    expect(repository.findAlertsByOffset("guild-1", 30, "minutes", "all").map((alert) => alert.id)).toEqual([matchingAlert.id]);
+  });
+
+  it("adds and removes one recipient without replacing others", () => {
+    const repository = createRepository();
+    const alert = repository.addAlert("guild-1", 1, "days");
+    repository.setAlertRecipients(alert.id, ["user-1"]);
+
+    repository.addAlertRecipient(alert.id, "user-2");
+    repository.addAlertRecipient(alert.id, "user-2");
+    expect(repository.getAlertRecipients(alert.id)).toEqual(["user-1", "user-2"]);
+
+    repository.removeAlertRecipient(alert.id, "user-2");
+    expect(repository.getAlertRecipients(alert.id)).toEqual(["user-1"]);
+  });
+
+  it("deletes alerts when their recipient set becomes empty", () => {
+    const repository = createRepository();
+    const alert = repository.addAlert("guild-1", 30, "minutes");
+    repository.setAlertRecipients(alert.id, ["user-1"]);
+
+    repository.removeAlertRecipient(alert.id, "user-1");
+
+    expect(repository.getAlert(alert.id)).toBeNull();
+    expect(repository.listAlerts("guild-1")).toEqual([]);
+  });
+
+  it("deletes abandoned recipientless alerts from alert listings", () => {
+    const repository = createRepository();
+    const abandonedAlert = repository.addAlert("guild-1", 30, "minutes");
+    const activeAlert = repository.addAlert("guild-1", 1, "days");
+    repository.setAlertRecipients(activeAlert.id, ["user-1"]);
+
+    expect(repository.listAlerts("guild-1").map((alert) => alert.id)).toEqual([activeAlert.id]);
+    expect(repository.getAlert(abandonedAlert.id)).toBeNull();
+  });
+
+  it("merges duplicate alerts with the same timing and filter during listings", () => {
+    const repository = createRepository();
+    const canonicalAlert = repository.addAlert("guild-1", 1, "days", "interested");
+    const duplicateAlert = repository.addAlert("guild-1", 1, "days", "interested");
+    const distinctFilterAlert = repository.addAlert("guild-1", 1, "days", "all");
+    repository.setAlertRecipients(canonicalAlert.id, ["user-1"]);
+    repository.setAlertRecipients(duplicateAlert.id, ["user-2"]);
+    repository.setAlertRecipients(distinctFilterAlert.id, ["user-3"]);
+
+    const alerts = repository.listAlerts("guild-1");
+
+    expect(alerts.map((alert) => alert.id)).toEqual([distinctFilterAlert.id, canonicalAlert.id]);
+    expect(repository.getAlert(duplicateAlert.id)).toBeNull();
+    expect(repository.getAlertRecipients(canonicalAlert.id)).toEqual(["user-1", "user-2"]);
+  });
+
+  it("moves duplicate sent history to the canonical alert when merging duplicate alerts", () => {
+    const repository = createRepository();
+    const canonicalAlert = repository.addAlert("guild-1", 1, "days", "interested");
+    const duplicateAlert = repository.addAlert("guild-1", 1, "days", "interested");
+    repository.setAlertRecipients(canonicalAlert.id, ["user-1"]);
+    repository.setAlertRecipients(duplicateAlert.id, ["user-2"]);
+    repository.recordSentAlert({
+      guildId: "guild-1",
+      eventId: "event-1",
+      alertId: duplicateAlert.id,
+      eventName: "Session",
+      scheduledStartAt: "2026-01-01T12:00:00.000Z",
+      offsetAmount: 1,
+      offsetUnit: "days",
+      attemptedRecipientIds: ["user-2"],
+      successfulRecipientIds: ["user-2"],
+      failedRecipients: [],
+      errorSummary: null,
+      sentAt: "2026-01-01T11:30:00.000Z"
+    });
+
+    repository.listAlerts("guild-1");
+
+    expect(repository.hasSentAlert("guild-1", "event-1", canonicalAlert.id)).toBe(true);
+    expect(repository.hasSentAlert("guild-1", "event-1", duplicateAlert.id)).toBe(false);
   });
 
   it("deletes alert recipients with the alert", () => {

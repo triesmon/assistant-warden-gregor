@@ -8,6 +8,7 @@ const baseAlert: Alert = {
   guildId: "guild-1",
   amount: 30,
   unit: "minutes",
+  eventTarget: "interested",
   recipientIds: ["user-1"],
   enabled: true,
   createdAt: "2026-01-01T00:00:00.000Z",
@@ -19,7 +20,8 @@ const baseEvent: ScheduledEventSnapshot = {
   guildId: "guild-1",
   name: "Session",
   scheduledStartAt: new Date("2026-01-01T12:00:00.000Z"),
-  status: GuildScheduledEventStatus.Scheduled
+  status: GuildScheduledEventStatus.Scheduled,
+  interestedUserIds: ["user-1"]
 };
 
 describe("scheduler due alerts", () => {
@@ -42,6 +44,49 @@ describe("scheduler due alerts", () => {
     });
 
     expect(due).toMatchObject([{ alert: baseAlert, recipientIds: ["user-1"] }]);
+  });
+
+  it("only alerts recipients interested in the scheduled event", () => {
+    const due = findDueAlerts({
+      now: new Date("2026-01-01T11:45:00.000Z"),
+      events: [{ ...baseEvent, interestedUserIds: ["user-2"] }],
+      alertsByGuild: new Map([
+        [
+          "guild-1",
+          [
+            {
+              ...baseAlert,
+              recipientIds: ["user-1", "user-2", "user-3"]
+            }
+          ]
+        ]
+      ]),
+      wasSent: () => false
+    });
+
+    expect(due).toMatchObject([{ recipientIds: ["user-2"] }]);
+  });
+
+  it("alerts all-target recipients even when they are not interested in the event", () => {
+    const due = findDueAlerts({
+      now: new Date("2026-01-01T11:45:00.000Z"),
+      events: [{ ...baseEvent, interestedUserIds: [] }],
+      alertsByGuild: new Map([["guild-1", [{ ...baseAlert, eventTarget: "all" }]]]),
+      wasSent: () => false
+    });
+
+    expect(due).toMatchObject([{ recipientIds: ["user-1"] }]);
+  });
+
+  it("skips due alerts when no configured recipients are interested yet", () => {
+    const due = findDueAlerts({
+      now: new Date("2026-01-01T11:45:00.000Z"),
+      events: [{ ...baseEvent, interestedUserIds: ["user-2"] }],
+      alertsByGuild: new Map([["guild-1", [baseAlert]]]),
+      wasSent: () => false
+    });
+
+    expect(due).toHaveLength(0);
   });
 
   it("skips sent, completed, and recipientless alerts", () => {

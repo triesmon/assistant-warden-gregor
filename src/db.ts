@@ -16,13 +16,13 @@ export function openDatabase(databasePath: string): Database.Database {
   return db;
 }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 4;
 
-// Keep schema creation idempotent and reset legacy alert data once for the v2 model.
+// Keep one current local schema; mismatched versions reset local bot data.
 export function initializeSchema(db: Database.Database): void {
   const currentVersion = db.pragma("user_version", { simple: true }) as number;
 
-  if (currentVersion < SCHEMA_VERSION) {
+  if (currentVersion !== 0 && currentVersion !== SCHEMA_VERSION) {
     db.exec(`
       DROP TABLE IF EXISTS alert_recipients;
       DROP TABLE IF EXISTS alert_rules;
@@ -43,6 +43,7 @@ export function initializeSchema(db: Database.Database): void {
       guild_id TEXT NOT NULL,
       amount INTEGER NOT NULL,
       unit TEXT NOT NULL CHECK (unit IN ('minutes', 'hours', 'days')),
+      event_target TEXT NOT NULL DEFAULT 'interested' CHECK (event_target IN ('all', 'interested')),
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,

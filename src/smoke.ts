@@ -1,5 +1,5 @@
 import { Client, GatewayIntentBits, REST, Routes } from "discord.js";
-import { EVENT_ALERTS_COMMAND } from "./commands";
+import { EVENT_ALERTS_COMMAND, SUBSCRIBE_COMMAND } from "./commands";
 import { loadConfig } from "./config";
 import { openDatabase } from "./db";
 
@@ -12,6 +12,7 @@ async function main(): Promise<void> {
   const rest = new REST({ version: "10" }).setToken(config.discordToken);
   const commands = (await rest.get(Routes.applicationCommands(config.discordClientId))) as Array<{ name: string }>;
   const hasEventAlertsCommand = commands.some((command) => command.name === EVENT_ALERTS_COMMAND);
+  const hasSubscribeCommand = commands.some((command) => command.name === SUBSCRIBE_COMMAND);
 
   const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildScheduledEvents]
@@ -64,6 +65,7 @@ async function main(): Promise<void> {
       {
         databaseOpened: true,
         hasEventAlertsCommand,
+        hasSubscribeCommand,
         ...result
       },
       null,
@@ -72,7 +74,11 @@ async function main(): Promise<void> {
   );
 
   if (!hasEventAlertsCommand) {
-    throw new Error("Global /event-alerts command is not registered.");
+    throw new Error("Global /gregor-admin command is not registered.");
+  }
+
+  if (!hasSubscribeCommand) {
+    throw new Error("Global /subscribe command is not registered.");
   }
 
   if (result.guilds === 0) {
