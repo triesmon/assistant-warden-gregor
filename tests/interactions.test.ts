@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { ComponentType, MessageFlags, PermissionsBitField } from "discord.js";
+import { ButtonStyle, ComponentType, MessageFlags, PermissionsBitField } from "discord.js";
 import { describe, expect, it } from "vitest";
 import { initializeSchema } from "../src/db";
 import {
@@ -161,6 +161,51 @@ describe("main alert panel", () => {
     expect(repository.listAlerts("guild-1")).toHaveLength(2);
     expect(repository.getAlertRecipients(targetAlert.id)).toEqual(["user-1"]);
     expect(repository.getAlertRecipients(sourceAlert.id)).toEqual(["user-2"]);
+  });
+
+  it("includes an auto-start toggle button in the main panel", () => {
+    const repository = createRepository();
+    repository.ensureGuild("guild-1");
+
+    const panel = buildMainPanel(repository, "guild-1");
+    const components = JSON.parse(JSON.stringify(panel.components));
+
+    // Find the button row (last component, type 1 = ActionRow)
+    const buttonRow = components[components.length - 1];
+    expect(buttonRow.type).toBe(ComponentType.ActionRow);
+
+    const toggleButton = buttonRow.components.find(
+      (c: { custom_id: string }) => c.custom_id === "eventAlerts:toggleAutoStart"
+    );
+    expect(toggleButton).toBeDefined();
+    expect(toggleButton.label).toBe("Auto-start: Off");
+    expect(toggleButton.style).toBe(ButtonStyle.Secondary);
+  });
+
+  it("shows auto-start toggle as On when enabled", () => {
+    const repository = createRepository();
+    repository.ensureGuild("guild-1");
+    repository.setAutoStartEnabled("guild-1", true);
+
+    const panel = buildMainPanel(repository, "guild-1");
+    const components = JSON.parse(JSON.stringify(panel.components));
+
+    const buttonRow = components[components.length - 1];
+    const toggleButton = buttonRow.components.find(
+      (c: { custom_id: string }) => c.custom_id === "eventAlerts:toggleAutoStart"
+    );
+    expect(toggleButton.label).toBe("Auto-start: On");
+    expect(toggleButton.style).toBe(ButtonStyle.Success);
+  });
+
+  it("includes a Manage Events permission note in the main panel", () => {
+    const repository = createRepository();
+    repository.ensureGuild("guild-1");
+
+    const panel = buildMainPanel(repository, "guild-1");
+    const components = JSON.parse(JSON.stringify(panel.components));
+
+    expect(JSON.stringify(components)).toContain("Requires the bot to have Manage Events permission");
   });
 });
 

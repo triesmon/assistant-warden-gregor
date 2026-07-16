@@ -2,11 +2,19 @@ import { Client, GatewayIntentBits, REST, Routes } from "discord.js";
 import { EVENT_ALERTS_COMMAND, SUBSCRIBE_COMMAND } from "./commands";
 import { loadConfig } from "./config";
 import { openDatabase } from "./db";
+import { AlertRepository } from "./repository";
 
 // Verify the live Discord setup without printing tokens or other secrets.
 async function main(): Promise<void> {
   const config = loadConfig();
   const db = openDatabase(config.databasePath);
+
+  // Verify the v5 migration applied the auto_start_enabled column.
+  const columns = db.pragma("table_info(guild_settings)") as Array<{ name: string }>;
+  const hasAutoStartColumn = columns.some((col) => col.name === "auto_start_enabled");
+  const autoStartGuildIds = new AlertRepository(db).listAutoStartGuildIds();
+  const noAutoStartGuildsByDefault = autoStartGuildIds.length === 0;
+
   db.close();
 
   const rest = new REST({ version: "10" }).setToken(config.discordToken);
@@ -64,6 +72,8 @@ async function main(): Promise<void> {
     JSON.stringify(
       {
         databaseOpened: true,
+        hasAutoStartColumn,
+        noAutoStartGuildsByDefault,
         hasEventAlertsCommand,
         hasSubscribeCommand,
         ...result
@@ -72,6 +82,14 @@ async function main(): Promise<void> {
       2
     )
   );
+
+  if (!hasAutoStartColumn) {
+    throw new Error("Database migration v5 did not apply: auto_start_enabled column is missing.");
+  }
+
+  if (!noAutoStartGuildsByDefault) {
+    throw new Error("listAutoStartGuildIds() should return an empty array by default.");
+  }
 
   if (!hasEventAlertsCommand) {
     throw new Error("Global /gregor-admin command is not registered.");
