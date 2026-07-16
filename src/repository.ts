@@ -307,6 +307,28 @@ export class AlertRepository {
       )
       .run(guildId);
   }
+
+  isAutoStartEnabled(guildId: string): boolean {
+    const row = this.db
+      .prepare("SELECT auto_start_enabled FROM guild_settings WHERE guild_id = ?")
+      .get(guildId) as { auto_start_enabled: number } | undefined;
+    return row?.auto_start_enabled === 1;
+  }
+
+  setAutoStartEnabled(guildId: string, enabled: boolean): void {
+    this.ensureGuild(guildId);
+    const now = new Date().toISOString();
+    this.db
+      .prepare("UPDATE guild_settings SET auto_start_enabled = ?, updated_at = ? WHERE guild_id = ?")
+      .run(enabled ? 1 : 0, now, guildId);
+  }
+
+  listAutoStartGuildIds(): string[] {
+    const rows = this.db
+      .prepare("SELECT guild_id FROM guild_settings WHERE auto_start_enabled = 1 ORDER BY guild_id")
+      .all() as Array<{ guild_id: string }>;
+    return rows.map((row) => row.guild_id);
+  }
 }
 
 function mapSentAlertRow(row: SentAlertRow): SentAlert {

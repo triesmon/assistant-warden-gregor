@@ -16,21 +16,51 @@ export function openDatabase(databasePath: string): Database.Database {
   return db;
 }
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
-// Keep one current local schema; mismatched versions reset local bot data.
+// Migrate sequentially from currentVersion to targetVersion inside one transaction.
+// Unknown versions (non-zero, non-chain) are rejected with an error instead of
+// silently dropping all data.
 export function initializeSchema(db: Database.Database): void {
   const currentVersion = db.pragma("user_version", { simple: true }) as number;
 
-  if (currentVersion !== 0 && currentVersion !== SCHEMA_VERSION) {
-    db.exec(`
-      DROP TABLE IF EXISTS alert_recipients;
-      DROP TABLE IF EXISTS alert_rules;
-      DROP TABLE IF EXISTS alerts;
-      DROP TABLE IF EXISTS sent_alerts;
-    `);
+  migrateSchema(db, currentVersion, SCHEMA_VERSION);
+}
+
+function migrateSchema(db: Database.Database, fromVersion: number, toVersion: number): void {
+  if (fromVersion === toVersion) {
+    return;
   }
 
+  if (fromVersion > toVersion) {
+    throw new Error(
+      `Database schema version ${fromVersion} is ahead of the expected version ${toVersion}. ` +
+        "Downgrading is not supported."
+    );
+  }
+
+  if (fromVersion !== 0 && fromVersion < 4) {
+    throw new Error(
+      `Unknown database schema version ${fromVersion}. Only versions 0 (fresh) and 4+ are supported.`
+    );
+  }
+
+  const migration = db.transaction(() => {
+    if (fromVersion === 0) {
+      applyV4BaseSchema(db);
+    }
+
+    if (fromVersion <= 4 && toVersion >= 5) {
+      applyV5Migration(db);
+    }
+
+    db.pragma(`user_version = ${toVersion}`);
+  });
+
+  migration();
+}
+
+function applyV4BaseSchema(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS guild_settings (
       guild_id TEXT PRIMARY KEY,
@@ -80,6 +110,17 @@ export function initializeSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_alert_recipients_alert ON alert_recipients(alert_id);
     CREATE INDEX IF NOT EXISTS idx_sent_alerts_guild ON sent_alerts(guild_id, sent_at DESC);
   `);
+}
 
-  db.pragma(`user_version = ${SCHEMA_VERSION}`);
+function applyV5Migration(db: Database.Database): void {
+  // Idempotent column addition — ignore if the column already exists from a
+  // partially-applied prior migration.
+  try {
+    db.exec("ALTER TABLE guild_settings ADD COLUMN auto_start_enabled INTEGER NOT NULL DEFAULT 0");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes("duplicate column name") && !message.includes("already exists")) {
+      throw error;
+    }
+  }
 }

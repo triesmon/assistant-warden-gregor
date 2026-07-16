@@ -43,6 +43,17 @@ export function findDueAlerts(input: {
   return dueAlerts;
 }
 
+// Find events that have reached or passed their start time and are still Scheduled.
+// Pure function with no Discord side effects, so this is fully unit-testable.
+export function findEventsToAutoStart(events: ScheduledEventSnapshot[], now: Date): ScheduledEventSnapshot[] {
+  return events.filter(
+    (event) =>
+      event.scheduledStartAt !== null &&
+      event.status === GuildScheduledEventStatus.Scheduled &&
+      event.scheduledStartAt.getTime() <= now.getTime()
+  );
+}
+
 export function isAlertDue(eventStart: Date, alert: Alert, now: Date): boolean {
   const alertAt = new Date(eventStart.getTime() - offsetToMilliseconds(alert.amount, alert.unit));
   return alertAt.getTime() <= now.getTime() && now.getTime() < eventStart.getTime();
@@ -62,6 +73,24 @@ export async function runAlertPoll(client: Client, repository: AlertRepository, 
 
   for (const dueAlert of dueAlerts) {
     await sendDueAlert(client, repository, dueAlert);
+  }
+
+  // Auto-start events whose start time has arrived. Each call is wrapped so one
+  // failure (e.g. missing permissions) never blocks the rest of the poll.
+  const autoStartGuildIds = repository.listAutoStartGuildIds();
+  const eventsToStart = findEventsToAutoStart(
+    events.filter((event) => autoStartGuildIds.includes(event.guildId)),
+    now
+  );
+  for (const event of eventsToStart) {
+    try {
+      await startEvent(client, event);
+    } catch (error) {
+      console.error(
+        `[auto-start] Unexpected error starting event ${event.id} (${event.name}) in guild ${event.guildId}:`,
+        error
+      );
+    }
   }
 }
 
@@ -120,6 +149,41 @@ async function fetchInterestedUserIds(event: GuildScheduledEvent): Promise<strin
   }
 
   return Array.from(userIds);
+}
+
+async function startEvent(client: Client, event: ScheduledEventSnapshot): Promise<void> {
+  const guild = client.guilds.cache.get(event.guildId);
+  if (!guild) {
+    console.warn(`[auto-start] Guild ${event.guildId} not in cache; skipping event ${event.id} (${event.name}).`);
+    return;
+  }
+
+  const scheduledEvent = guild.scheduledEvents.cache.get(event.id);
+  if (!scheduledEvent) {
+    console.warn(`[auto-start] Event ${event.id} (${event.name}) not in cache; skipping.`);
+    return;
+  }
+
+  try {
+    await scheduledEvent.setStatus(GuildScheduledEventStatus.Active, "Auto-started by Gregor.");
+    console.log(`[auto-start] Started event ${event.id} (${event.name}) in guild ${event.guildId}.`);
+  } catch (error) {
+    const code = (error as { code?: number }).code;
+    if (code === 10070) {
+      console.warn(`[auto-start] Event ${event.id} (${event.name}) no longer exists; skipping.`);
+    } else if (code === 50013) {
+      console.warn(
+        `[auto-start] Missing permissions to start event ${event.id} (${event.name}) in guild ${event.guildId}.`
+      );
+    } else if (typeof code === "number") {
+      // Other Discord API errors (e.g. already active/completed, invalid state) are expected and non-fatal.
+      console.warn(
+        `[auto-start] Discord error ${code} starting event ${event.id} (${event.name}) in guild ${event.guildId}; skipping.`
+      );
+    } else {
+      throw error;
+    }
+  }
 }
 
 async function sendDueAlert(client: Client, repository: AlertRepository, dueAlert: DueAlert): Promise<void> {

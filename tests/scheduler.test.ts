@@ -1,6 +1,6 @@
 import { GuildScheduledEventStatus } from "discord.js";
 import { describe, expect, it } from "vitest";
-import { buildAlertMessage, findDueAlerts, isAlertDue } from "../src/scheduler";
+import { buildAlertMessage, findDueAlerts, findEventsToAutoStart, isAlertDue } from "../src/scheduler";
 import type { Alert, ScheduledEventSnapshot } from "../src/types";
 
 const baseAlert: Alert = {
@@ -134,5 +134,71 @@ describe("scheduler due alerts", () => {
       { name: "Start time", value: "<t:1767268800:F>" },
       { name: "Reminder", value: "30 minutes before start" }
     ]);
+  });
+});
+
+describe("findEventsToAutoStart", () => {
+  it("returns events at or past their start time with Scheduled status", () => {
+    const now = new Date("2026-01-01T12:00:00.000Z");
+    const events: ScheduledEventSnapshot[] = [
+      { ...baseEvent, scheduledStartAt: new Date("2026-01-01T12:00:00.000Z") },
+      { ...baseEvent, id: "event-2", scheduledStartAt: new Date("2026-01-01T11:59:59.000Z") }
+    ];
+
+    const result = findEventsToAutoStart(events, now);
+
+    expect(result.map((e) => e.id)).toEqual(["event-1", "event-2"]);
+  });
+
+  it("skips events whose start time has not yet arrived", () => {
+    const now = new Date("2026-01-01T11:59:59.000Z");
+    const events: ScheduledEventSnapshot[] = [
+      { ...baseEvent, scheduledStartAt: new Date("2026-01-01T12:00:00.000Z") }
+    ];
+
+    const result = findEventsToAutoStart(events, now);
+
+    expect(result).toHaveLength(0);
+  });
+
+  it("skips events that are not Scheduled", () => {
+    const now = new Date("2026-01-01T12:30:00.000Z");
+    const events: ScheduledEventSnapshot[] = [
+      { ...baseEvent, status: GuildScheduledEventStatus.Active },
+      { ...baseEvent, id: "event-2", status: GuildScheduledEventStatus.Completed },
+      { ...baseEvent, id: "event-3", status: GuildScheduledEventStatus.Canceled }
+    ];
+
+    const result = findEventsToAutoStart(events, now);
+
+    expect(result).toHaveLength(0);
+  });
+
+  it("skips events with a null scheduledStartAt", () => {
+    const now = new Date("2026-01-01T12:00:00.000Z");
+    const events: ScheduledEventSnapshot[] = [
+      { ...baseEvent, scheduledStartAt: null }
+    ];
+
+    const result = findEventsToAutoStart(events, now);
+
+    expect(result).toHaveLength(0);
+  });
+
+  it("returns multiple events across guilds that are ready to start", () => {
+    const now = new Date("2026-01-01T12:00:00.000Z");
+    const events: ScheduledEventSnapshot[] = [
+      { ...baseEvent, scheduledStartAt: new Date("2026-01-01T12:00:00.000Z") },
+      {
+        ...baseEvent,
+        id: "event-2",
+        guildId: "guild-2",
+        scheduledStartAt: new Date("2026-01-01T11:30:00.000Z")
+      }
+    ];
+
+    const result = findEventsToAutoStart(events, now);
+
+    expect(result.map((e) => e.id)).toEqual(["event-1", "event-2"]);
   });
 });

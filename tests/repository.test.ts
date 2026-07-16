@@ -248,3 +248,53 @@ describe("AlertRepository", () => {
     expect(repository.listSentHistory("guild-2", 0, 10)).toHaveLength(1);
   });
 });
+
+describe("auto-start settings", () => {
+  it("defaults to disabled for every guild", () => {
+    const repository = createRepository();
+    repository.ensureGuild("guild-1");
+
+    expect(repository.isAutoStartEnabled("guild-1")).toBe(false);
+    expect(repository.listAutoStartGuildIds()).toEqual([]);
+  });
+
+  it("returns false for a guild that has never been configured", () => {
+    const repository = createRepository();
+
+    expect(repository.isAutoStartEnabled("non-existent")).toBe(false);
+  });
+
+  it("toggles auto-start on and off", () => {
+    const repository = createRepository();
+    repository.ensureGuild("guild-1");
+
+    repository.setAutoStartEnabled("guild-1", true);
+    expect(repository.isAutoStartEnabled("guild-1")).toBe(true);
+    expect(repository.listAutoStartGuildIds()).toEqual(["guild-1"]);
+
+    repository.setAutoStartEnabled("guild-1", false);
+    expect(repository.isAutoStartEnabled("guild-1")).toBe(false);
+    expect(repository.listAutoStartGuildIds()).toEqual([]);
+  });
+
+  it("lists only guilds with auto-start enabled", () => {
+    const repository = createRepository();
+    repository.ensureGuild("guild-1");
+    repository.ensureGuild("guild-2");
+    repository.ensureGuild("guild-3");
+
+    repository.setAutoStartEnabled("guild-1", true);
+    repository.setAutoStartEnabled("guild-3", true);
+
+    expect(repository.listAutoStartGuildIds()).toEqual(["guild-1", "guild-3"]);
+  });
+
+  it("creates a guild row on setAutoStartEnabled when the guild is new", () => {
+    const repository = createRepository();
+
+    repository.setAutoStartEnabled("guild-1", true);
+
+    expect(repository.isAutoStartEnabled("guild-1")).toBe(true);
+    expect(repository.listConfiguredGuildIds()).toEqual(["guild-1"]);
+  });
+});

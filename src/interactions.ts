@@ -37,7 +37,8 @@ const IDS = {
   clearHistory: "eventAlerts:clearHistory",
   confirmClearHistory: "eventAlerts:confirmClearHistory",
   history: "eventAlerts:history",
-  back: "eventAlerts:back"
+  back: "eventAlerts:back",
+  toggleAutoStart: "eventAlerts:toggleAutoStart"
 } as const;
 
 const SUBSCRIPTION_IDS = {
@@ -248,6 +249,22 @@ async function handleEventAlertsButton(interaction: ButtonInteraction, repositor
   if (interaction.customId.startsWith("eventAlerts:deleteAlert:")) {
     repository.deleteAlert(interaction.customId.split(":")[2]);
     await interaction.update(buildMainPanel(repository, guildId, interaction.user.id));
+    return;
+  }
+
+  if (interaction.customId === IDS.toggleAutoStart) {
+    if (!canConfigureAlerts(interaction.memberPermissions)) {
+      await interaction.reply({
+        content: "You need the Manage Events permission to change auto-start.",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    const enabled = repository.isAutoStartEnabled(guildId);
+    repository.setAutoStartEnabled(guildId, !enabled);
+    await interaction.update(buildMainPanel(repository, guildId, interaction.user.id));
+    return;
   }
 }
 
@@ -571,6 +588,7 @@ export function buildMainPanel(
         [
           "# Event alerts",
           "Configure DM reminders for this server's scheduled events.",
+          "*Requires the bot to have Manage Events permission for auto-start.*",
           "",
           "**Alerts**"
         ].join("\n")
@@ -602,13 +620,18 @@ export function buildMainPanel(
 
   headerContainer.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));
 
+  const autoStartEnabled = repository.isAutoStartEnabled(guildId);
   const buttonRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(IDS.addAlert)
       .setLabel("Add alert")
       .setStyle(ButtonStyle.Primary)
       .setDisabled(alerts.length >= MAX_ALERTS),
-    new ButtonBuilder().setCustomId(`${IDS.history}:0`).setLabel("Sent history").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`${IDS.history}:0`).setLabel("Sent history").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(IDS.toggleAutoStart)
+      .setLabel(autoStartEnabled ? "Auto-start: On" : "Auto-start: Off")
+      .setStyle(autoStartEnabled ? ButtonStyle.Success : ButtonStyle.Secondary)
   );
 
   components.push(buttonRow);
